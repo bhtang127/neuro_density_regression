@@ -1,0 +1,301 @@
+---
+title: "Transformed_Regression"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data preparation
+```{r data, message=FALSE, warning=FALSE}
+source("load_data.R")
+library(fda)
+library(tidyverse)
+library(glmnet)
+library(corrplot)
+library(fdadensity)
+library(refund)
+library(lmtest)
+
+### basis function
+nb = 19
+basisobj = create.bspline.basis(c(0,1), nb)
+basisobj2 = create.bspline.basis(c(-1,1), nb)
+basisobj3 = create.bspline.basis(c(-4,4), nb)
+```
+
+### Functional regression with refund
+
+```{r func, message=FALSE, warning=FALSE}
+pdata = data.frame(A=Apost[post_flag], Xpost[post_flag,])
+pdata$ID = 1:nrow(pdata)
+pdata$mean = apply(corr_post[post_flag,],1,mean)
+pdata$corr = corr_post[post_flag,]
+
+# pdata = data.frame(A=Apost, Xpost)
+# pdata$ID = 1:nrow(pdata)
+# pdata$mean = apply(corr_post,1,mean)
+# pdata$corr = corr_post
+
+analysis = function(pdata, Tr, fml = "A~Variantn+Variants+GenderM+mean", 
+                    range = c(-1,1)){
+  args = seq(range[1], range[2], length.out = 512)
+  Tcorr = c()
+  for(i in 1:nrow(pdata$corr)){
+    Tcorr = rbind(Tcorr, Tr(pdata$corr[i,])$y)
+  }
+  # return(Tcorr)
+  pdata$Tcorr = Tcorr
+  fml = as.formula(paste0(fml,"+lf(Tcorr,argvals=args)"))
+  fit.t = pfr(fml, data=pdata, family='binomial')
+  plot(fit.t,xlab='T(correlation)',ylab='value')
+  abline(h=0, col="red", lty=2, lwd=1)
+  fit.t
+}
+
+fit.0 = analysis(pdata, T0, "A~Variantn+Variants+GenderM")
+fit.l = analysis(pdata, Tl)
+fit.q = analysis(pdata, Tq, "A~Variantn+Variants+GenderM")
+# fit.qd = analysis(pdata, Tqd, range = c(0,1))
+fit.lqd = analysis(pdata, Tlqd, range = c(0,1))
+fit.gq = analysis(pdata, Tgq, range = c(0,1))
+
+fit.glm = glm(A~Variantn+Variants+GenderM+mean,
+              family='binomial',data=pdata)
+fit.glm0 = glm(A~Variantn+Variants+GenderM,
+              family='binomial',data=pdata)
+
+lrtest(fit.glm, fit.lqd)
+lrtest(fit.glm0, fit.q)
+```
+
+### PCR with refund
+```{r pcr, warning=FALSE, message=FALSE}
+pcr = function(pdata, Tr, fml = "A~Variantn+Variants+GenderM+mean", 
+               range = c(-1,1), xlab="T(correlation)"){
+  args = seq(range[1], range[2], length.out = 512)
+  Tcorr = c()
+  for(i in 1:nrow(pdata$corr)){
+    Tcorr = rbind(Tcorr, Tr(pdata$corr[i,])$y)
+  }
+  pdata$Tcorr = Tcorr
+  fml = as.formula(paste0(fml,"+fpc(Tcorr,method='fpca.sc',argvals=args)"))
+  fit.t = pfr(fml, data=pdata, family='binomial')
+  plot(fit.t,xlab=xlab,ylab='value')
+  abline(h=0, col="red", lty=2, lwd=1)
+  fit.t
+}
+
+fit.0 = pcr(pdata, T0, "A~Variantn+Variants+GenderM", xlab = "correlation")
+fit.l = pcr(pdata, Tl, xlab = "correlation")
+fit.q = pcr(pdata, Tq, "A~Variantn+Variants+GenderM")
+# fit.qd = pcr(pdata, Tqd, range = c(0,1))
+fit.lqd = pcr(pdata, Tlqd, range = c(0,1), xlab = "percentage")
+fit.gq = pcr(pdata, Tgq, range = c(0,1))
+
+lrtest(fit.glm, fit.lqd)
+lrtest(fit.glm0, fit.q)
+lrtest(fit.glm, fit.l)
+lrtest(fit.glm0, fit.0)
+lrtest(fit.glm, fit.gq)
+```
+
+### stimulation induced connectivity
+```{r, warning=FALSE}
+beta = coef(fit.lqd, n=512)
+plot(beta$X.argvals, beta$value, type = "l")
+
+Tcorr = c()
+for(i in 1:nrow(pdata$corr)){
+  Tcorr = rbind(Tcorr, Tlqd(pdata$corr[i,])$y)
+}
+
+plot(beta$X.argvals, c(beta$value) * Tcorr[10,], type="l")
+
+induced.connect = list()
+for(i in 1:length(post_sub[post_flag])){
+  subi = post_sub[post_flag][i]
+  mi = as.matrix(post_iv$tc.cor[[subi]])
+  corr_i = mi[upper.tri(mi)]
+  corr_i = na.omit(corr_i)
+  Fi = ecdf(corr_i)
+  weight = c(beta$value) * Tcorr[i,]
+  sig = approx(beta$X.argvals, weight, Fi(mi))$y
+  induced = matrix(sig, nrow=nrow(mi), ncol=ncol(mi))
+  diag(induced) = 0; induced[is.na(induced)] = 0
+  colnames(induced) = colnames(mi)
+  rownames(induced) = colnames(mi)
+  induced.connect[[subi]] = induced
+}
+
+sapply(induced.connect, function(s){sum(is.na(s))})
+
+delet_outlier = function(map){
+  map[map > quantile(map,0.99)] = 0
+  map
+}
+
+corrplot(delet_outlier(induced.connect$ABK), is.corr = FALSE, tl.cex = 0.2)
+
+induced_avg = matrix(0, nrow(induced.connect$ABK), ncol(induced.connect$ABK))
+colnames(induced_avg) = colnames(induced.connect$ABK)
+rownames(induced_avg) = colnames(induced.connect$ABK)
+collect = matrix(NA, 78*78, 47)
+for(i in 1:length(post_sub[post_flag])){
+  subj = post_sub[post_flag][i]
+  induced_avg = induced_avg + induced.connect[[subj]]
+  collect[,i] = as.vector(induced.connect[[subj]])
+}
+induced_avg = induced_avg / length(post_sub[post_flag])
+
+qs = apply(collect, 1, function(s){c(quantile(s, c(0.025,0.05,0.95,0.975)),
+                                     sqrt(var(s))+1e-5)})
+
+net = matrix(qs[2,]*qs[3,] > 0, 78, 78)
+show.pairs(net, colnames(induced_avg))
+
+induced_t = -induced_avg / matrix(qs[5,], 78, 78)
+induced_p = 2*(1-pnorm(abs(induced_t)))
+
+corrplot(abs(induced_t), is.corr = FALSE, tl.cex = 0.5, method = "shade")
+corrplot(-induced_avg, is.corr = FALSE, tl.cex = 0.5, method = "shade")
+
+net.thresh = abs(induced_t) > qnorm(0.975)
+corrplot(net.thresh, tl.cex = 0.5)
+show.pairs(net.thresh, colnames(induced_avg))
+
+```
+
+## fPCA regression
+```{r pca, message=FALSE, warning=FALSE}
+TPCglm = function(A, X, C, basisobj, Trans, family='binomial', 
+                  ratio = 0.95, alpha = 0.05, verbose=FALSE){
+  Tf = c(); Ef = c()
+  for(i in 1:nrow(C)){
+    Tdi = Trans(C[i,])
+    Tfi = c(smooth.basis(Tdi$x,Tdi$y,basisobj)$fd$coef)
+    Tf = rbind(Tf, Tfi)
+    Ef = c(Ef, mean(C[i,]))
+  }
+  fs = fd(t(Tf), basisobj)
+  pca = pca.fd(fs, nharm = 10)
+  for(p in 1:10){
+    if(cumsum(pca$varprop)[p] > ratio)
+      break
+  }
+  scores = pca$scores[,1:p]
+  colnames(scores) = paste0("PC",1:p)
+  
+  fit0 = glm(Treat~., family='binomial', data.frame(Treat=A, X, mean=Ef))
+  fit1 = glm(Treat~., family='binomial', data.frame(Treat=A, X, mean=Ef, scores))
+  
+  print(anova(fit0, fit1))
+  start = 1+ncol(X)+2; end = nrow(summary(fit1)$coefficients)
+  cov.pc = summary(fit1,correlation=TRUE)$cov.scaled[start:end, start:end]
+  coef.pc = summary(fit1)$coefficients[start:end,1]
+  
+  ys = c()
+  xs = seq(basisobj$rangeval[1],basisobj$rangeval[2],length.out=256)
+  for(i in 1:1000){
+    coeff = rnorm.mul(coef.pc, cov.pc)
+    beta = fd(pca$harmonics$coefs[,1:p] %*% coeff, basisobj)
+    ys = rbind(ys, t(eval.fd(xs,beta)))
+  }
+  
+  if(verbose){
+    plot(fs)
+    par(mfrow=c(2,2)); plot(pca.fd(fs, nharm = 4)); par(mfrow=c(1,1))
+    plot.f(xs,rbind(apply(ys,2,function(s){quantile(s,1-alpha/2)}),
+                      colMeans(ys),
+                      apply(ys,2,function(s){quantile(s,alpha/2)})))
+  }
+  fit1
+}
+```
+
+```{r, warning=FALSE}
+res = TPCglm(Apost,Xpost[,-4],corr_post,basisobj,Tqd, verbose = TRUE)
+```
+
+```{r, warning=FALSE}
+res = TPCglm(Apost,Xpost,corr_post,basisobj,Tlqd,ratio=0.85, verbose = TRUE)
+```
+
+```{r, warning=FALSE}
+res = TPCglm(Apost,Xpost,corr_post,basisobj,Tq, verbose = TRUE)
+```
+
+```{r, warning=FALSE}
+res = TPCglm(Apost,Xpost,corr_post,basisobj2,T0, verbose = TRUE)
+```
+
+```{r, warning=FALSE}
+res = TPCglm(Apost,Xpost,corr_post,basisobj2,Tl, verbose = TRUE)
+```
+
+```{r, warning=FALSE}
+res = TPCglm(Apost,Xpost,corr_post,basisobj3,Tstd, verbose = TRUE)
+```
+
+
+## Direct Functional Regression
+```{r fr, message=FALSE, warning=FALSE}
+cv.Tfglm = function(A, X, C, basisobj, Trans, family='binomial', 
+                    bootstrap = 0, alpha = 0.05, adjust = 0, verbose=FALSE, split=0.5){
+  P = inprod(basisobj, basisobj); es = eigen(getbasispenalty(basisobj, 2))
+  L = es$values; L = L/max(L); L[L<1e-10] = 0
+  U = es$vectors
+  Tf = c(); Ef = c()
+  for(i in 1:nrow(C)){
+    Tdi = Trans(C[i,])
+    Tfi = c(smooth.basis(Tdi$x,Tdi$y,basisobj)$fd$coef)
+    Tf = rbind(Tf, Tfi)
+    Ef = c(Ef, mean(C[i,]))
+  }
+  X = cbind(X, mean=Ef)
+  W = Tf %*% P %*% U; colnames(W) = paste0("Coef_b",1:ncol(W)); rownames(W)=NULL
+  pf = c(rep(0, ncol(X)), L); pf = pf + adjust
+  if(bootstrap == 0){
+    fit0 = cv.glmnet(cbind(X, W), A, family=family, alpha=0,
+                     penalty.factor=pf, nfolds=nrow(X))
+    lam = fit0$lambda.1se; coeff = coef(fit0, s=lam)
+    coeff[(ncol(X)+2):length(coeff)] = U %*% coeff[(ncol(X)+2):length(coeff)]
+    if(verbose){
+      plot(fd(t(Tf), basisobj)); plot(fit0)
+      plot(fd(coeff[(ncol(X)+2):length(coeff)],basisobj))
+    }
+    return(list(lambda=lam, coeff = coeff))
+  }
+  else{
+    coefs = c(); ys = c()
+    xs = seq(basisobj$rangeval[1],basisobj$rangeval[2],length.out=256)
+    for(i in 1:bootstrap){
+      cat("iter: "); cat(i); cat("  ")
+      data = bootstrap.sample(A, X, W, W, sub=0, split=split)
+      try({
+        fit0 = cv.glmnet(cbind(data$train$X1, data$train$X2), data$train$Y, 
+                         family=family, alpha=0, penalty.factor=pf, nfolds=nrow(data$train$X1))
+        lam = fit0$lambda.min
+        fit1 = cv.glmnet(cbind(data$val$X1, data$val$X2), data$val$Y, family=family, 
+                         lambda=c(lam,lam/2), alpha=0, penalty.factor=pf, nfolds=nrow(data$val$X1))
+        # coeff = as.vector(fit1$beta); names(coeff) = rownames(fit1$beta)
+        coeff = coef(fit1, s=lam)
+        coeff[(ncol(X)+2):length(coeff)] = U %*% coeff[(ncol(X)+2):length(coeff)]
+        fi = fd(coeff[(ncol(X)+2):length(coeff)], basisobj)
+        ys = rbind(ys, t(eval.fd(xs,fi)))
+        coefs = rbind(coefs, coeff)
+      }, silent = TRUE)
+    }
+    cat("\n")
+    if(verbose){
+      print(nrow(ys))
+      plot(fd(t(Tf), basisobj)) 
+      plot.f(xs,rbind(apply(ys,2,function(s){quantile(s,1-alpha/2)}),
+                      colMeans(ys),
+                      apply(ys,2,function(s){quantile(s,alpha/2)})))
+    }
+    return(coefs)
+  }
+}
+```
